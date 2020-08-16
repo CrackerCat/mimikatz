@@ -18,6 +18,7 @@ const KUHL_M_C kuhl_m_c_net[] = {
 	{kuhl_m_net_serverinfo,	L"serverinfo", L""},
 	{kuhl_m_net_trust,		L"trust", L""},
 	{kuhl_m_net_deleg,		L"deleg", L""},
+	{kuhl_m_net_dcom_if,	L"if", L""},
 };
 const KUHL_M kuhl_m_net = {
 	L"net",	L"", NULL,
@@ -575,12 +576,24 @@ NTSTATUS kuhl_m_net_serverinfo(int argc, wchar_t * argv[])
 
 const PCWCHAR TRUST_ATTRIBUTES_FLAGS[] = {L"IN_FOREST", L"DIRECT_OUTBOUND", L"TREE_ROOT", L"PRIMARY", L"NATIVE_MODE", L"DIRECT_INBOUND"};
 const PCWCHAR TRUST_ATTRIBUTES[] = {L"NON_TRANSITIVE", L"UPLEVEL_ONLY", L"FILTER_SIDS/QUARANTINED_DOMAIN", L"FOREST_TRANSITIVE", L"CROSS_ORGANIZATION", L"WITHIN_FOREST", L"TREAT_AS_EXTERNAL", L"TRUST_USES_RC4_ENCRYPTION", L"TRUST_USES_AES_KEYS"};
+const PCWCHAR TRUST_ATTRIBUTES_LEGACY[] = {L"TREE_PARENT", L"TREE_ROOT"}; // 0x00400000, 0x00800000
+const PCWCHAR TRUST_DIRECTION[] = {L"DISABLED", L"INBOUND", L"OUTBOUND", L"BIDIRECTIONAL"};
 NTSTATUS kuhl_m_net_trust(int argc, wchar_t * argv[])
 {
 	PDS_DOMAIN_TRUSTS pTrusts;
 	ULONG uTrusts;
 	DWORD ret, i, j;
-	ret = DsEnumerateDomainTrusts(argc ? argv[0] : NULL, DS_DOMAIN_VALID_FLAGS, &pTrusts, &uTrusts);
+	PWCHAR server, dn, sysDN, pAttribute, myAttrs[] = {L"trustPartner", L"flatName", L"trustAttributes", L"trustDirection", L"trustType", L"objectGUID", NULL};
+	PLDAP ld;
+	PLDAPMessage pMessage = NULL, pEntry;
+	BerElement* pBer = NULL;
+	PBERVAL *pBerVal;
+	PCHAR aBuffer;
+
+	kull_m_string_args_byName(argc, argv, L"server", &server, NULL);
+
+	kprintf(L"RPC mode: ");
+	ret = DsEnumerateDomainTrusts(server, DS_DOMAIN_VALID_FLAGS, &pTrusts, &uTrusts);
 	if(ret == ERROR_SUCCESS)
 	{
 		for(i = 0; i < uTrusts; i++)
@@ -615,9 +628,12 @@ NTSTATUS kuhl_m_net_trust(int argc, wchar_t * argv[])
 				else kprintf(L"?\n");
 			}
 			kprintf(L"     Attributes: 0x%08x ( ", pTrusts[i].TrustAttributes);
-			for(j = 0; j < (8 * sizeof(DWORD)); j++)
+			for(j = 0; j < (8 * sizeof(DWORD) - 10); j++)
 				if((pTrusts[i].TrustAttributes >> j) & 1)
-				kprintf(L"%s ; ", (j < ARRAYSIZE(TRUST_ATTRIBUTES)) ? TRUST_ATTRIBUTES[j] : L"?");
+					kprintf(L"%s ; ", (j < ARRAYSIZE(TRUST_ATTRIBUTES)) ? TRUST_ATTRIBUTES[j] : L"?");
+			for(j = 0; j < 10; j++)
+				if((pTrusts[i].TrustAttributes >> (j + 22)) & 1)
+					kprintf(L"%s ; ", (j < ARRAYSIZE(TRUST_ATTRIBUTES_LEGACY)) ? TRUST_ATTRIBUTES_LEGACY[j] : L"?");
 			kprintf(L")\n     SID       : ");
 			kull_m_string_displaySID(pTrusts[i].DomainSid);
 			kprintf(L"\n     GUID      : ");
@@ -627,6 +643,99 @@ NTSTATUS kuhl_m_net_trust(int argc, wchar_t * argv[])
 		NetApiBufferFree(pTrusts);
 	}
 	else PRINT_ERROR(L"DsEnumerateDomainTrusts: %u\n", ret);
+
+	kprintf(L"\n\nLDAP mode: ");
+	if(kull_m_ldap_getLdapAndRootDN(server, L"defaultNamingContext", &ld, &dn))
+	{
+		if(kull_m_string_sprintf(&sysDN, L"CN=System,%s", dn))
+		{
+			ret = ldap_search_s(ld, sysDN, LDAP_SCOPE_ONELEVEL, L"(objectClass=trustedDomain)", myAttrs,  FALSE, &pMessage);
+			if(ret == LDAP_SUCCESS)
+			{
+				kprintf(L"%u entries\n", ldap_count_entries(ld, pMessage));
+				for(pEntry = ldap_first_entry(ld, pMessage); pEntry; pEntry = ldap_next_entry(ld, pEntry))
+				{
+					kprintf(L"\n%s\n", ldap_get_dn(ld, pEntry));
+					for(pAttribute = ldap_first_attribute(ld, pEntry, &pBer); pAttribute; pAttribute = ldap_next_attribute(ld, pEntry, pBer))
+					{
+						kprintf(L"  %s: ", pAttribute);
+						if(pBerVal = ldap_get_values_len(ld, pEntry, pAttribute))
+						{
+							if((_wcsicmp(pAttribute, L"objectGUID") == 0))
+							{
+								kull_m_string_displayGUID((LPGUID) pBerVal[0]->bv_val);
+								kprintf(L"\n");
+							}
+							else if(
+								(_wcsicmp(pAttribute, L"trustPartner") == 0) ||
+								(_wcsicmp(pAttribute, L"flatName") == 0)
+								)
+							{
+								kprintf(L"%*S\n", pBerVal[0]->bv_len, pBerVal[0]->bv_val);
+							}
+							else
+							{
+								if(kull_m_string_copyA_len(&aBuffer, pBerVal[0]->bv_val, pBerVal[0]->bv_len))
+								{
+									ret = strtoul(aBuffer, NULL, 10);
+									kprintf(L"0x%08x - ", ret);
+
+
+									if(_wcsicmp(pAttribute, L"trustAttributes") == 0)
+									{
+										for(j = 0; j < (8 * sizeof(DWORD) - 10); j++)
+											if((ret >> j) & 1)
+												kprintf(L"%s ; ", (j < ARRAYSIZE(TRUST_ATTRIBUTES)) ? TRUST_ATTRIBUTES[j] : L"?");
+										for(j = 0; j < 10; j++)
+											if((ret >> (j + 22)) & 1)
+												kprintf(L"%s ; ", (j < ARRAYSIZE(TRUST_ATTRIBUTES_LEGACY)) ? TRUST_ATTRIBUTES_LEGACY[j] : L"?");
+										kprintf(L"\n");
+									}
+									else if(_wcsicmp(pAttribute, L"trustType") == 0)
+									{
+										switch(ret)
+										{
+										case TRUST_TYPE_DOWNLEVEL:
+											kprintf(L"DOWNLEVEL (DC < 2000)\n");
+											break;
+										case TRUST_TYPE_UPLEVEL:
+											kprintf(L"UPLEVEL (DC >= 2000)\n");
+											break;
+										case TRUST_TYPE_MIT:
+											kprintf(L"MIT Kerberos realm\n");
+											break;
+										case 0x00000004 /*TRUST_TYPE_DCE*/:
+											kprintf(L"DCE realm\n");
+											break;
+										default:
+											if((pTrusts[i].TrustType >= 0x5) && (pTrusts[i].TrustType <= 0x000fffff))
+												kprintf(L"reserved for future use\n");
+											else if((pTrusts[i].TrustType >= 0x00100000) && (pTrusts[i].TrustType <= 0xfff00000))
+												kprintf(L"provider specific trust level\n");
+											else kprintf(L"?\n");
+										}
+									}
+									else if(_wcsicmp(pAttribute, L"trustDirection") == 0)
+										kprintf(L"%s\n", TRUST_DIRECTION[ret & 0x00000003]);
+									LocalFree(aBuffer);
+								}
+							}
+							ldap_value_free_len(pBerVal);
+						}
+						ldap_memfree(pAttribute);
+					}
+					if(pBer)
+						ber_free(pBer, 0);
+				}
+			}
+			else PRINT_ERROR(L"ldap_search_s 0x%x (%u)\n", ret, ret);
+			if(pMessage)
+				ldap_msgfree(pMessage);
+			LocalFree(sysDN);
+		}
+		LocalFree(dn);
+		ldap_unbind(ld);
+	}
 	return STATUS_SUCCESS;
 }
 
@@ -652,7 +761,7 @@ L")";
 	BOOL isCheckDNS = kull_m_string_args_byName(argc, argv, L"dns", NULL, NULL);
 	kull_m_string_args_byName(argc, argv, L"server", &server, NULL);
 
-	if(kull_m_ldap_getLdapAndRootDN(server, &ld, &dn))
+	if(kull_m_ldap_getLdapAndRootDN(server, NULL, &ld, &dn))
 	{
 		dwRet = ldap_search_s(ld, dn, LDAP_SCOPE_SUBTREE, filter, myAttrs, FALSE, &pMessage);
 		if(dwRet == LDAP_SUCCESS)
@@ -744,6 +853,41 @@ L")";
 			ldap_msgfree(pMessage);
 		LocalFree(dn);
 		ldap_unbind(ld);
+	}
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS kuhl_m_net_dcom_if(int argc, wchar_t * argv[])
+{
+	RPC_BINDING_HANDLE hBinding;
+	RPC_STATUS rpcStatus;
+	error_status_t errorStatus;
+	COMVERSION ComVersion;
+	DUALSTRINGARRAY *dualStringArray = NULL;
+	DWORD i = 0;
+
+	if(kull_m_rpc_createBinding(NULL, L"ncacn_ip_tcp", argc ? argv[0] : NULL, L"135", NULL, FALSE, RPC_C_AUTHN_NONE, NULL, RPC_C_IMP_LEVEL_DEFAULT, &hBinding, NULL))
+	{
+		rpcStatus = RpcBindingSetAuthInfo(hBinding, NULL, RPC_C_AUTHN_LEVEL_NONE, RPC_C_AUTHN_NONE, NULL, RPC_C_AUTHZ_NONE);
+		if(rpcStatus == RPC_S_OK)
+		{
+			RpcTryExcept
+			{
+				errorStatus = ServerAlive2(hBinding, &ComVersion, &dualStringArray, &i);
+				if(errorStatus == STATUS_SUCCESS)
+				{
+					for(i = 0; (i < ((DWORD) (dualStringArray->wNumEntries - dualStringArray->wSecurityOffset))) && dualStringArray->aStringArray[i]; i += lstrlen((wchar_t *) dualStringArray->aStringArray + i) + 1)
+						kprintf(L"%s\n", dualStringArray->aStringArray + i);
+					MIDL_user_free(dualStringArray);
+				}
+				else PRINT_ERROR(L"ServerAlive2: 0x%08x (%u)\n", errorStatus, errorStatus);
+			}
+			RpcExcept(RPC_EXCEPTION)
+				PRINT_ERROR(L"RPC Exception: 0x%08x (%u)\n", RpcExceptionCode(), RpcExceptionCode());
+			RpcEndExcept
+		}
+		else PRINT_ERROR(L"RpcBindingSetAuthInfo: 0x%08x (%u)\n", rpcStatus, rpcStatus);
+		kull_m_rpc_deleteBinding(&hBinding);
 	}
 	return STATUS_SUCCESS;
 }
